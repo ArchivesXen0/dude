@@ -1,0 +1,124 @@
+const express = require('express');
+const session = require('express-session');
+const axios = require('axios');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Environment variables (set these in Render dashboard)
+const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const REDIRECT_URI = process.env.REDIRECT_URI || `https://your-app.onrender.com/auth/discord/callback`;
+const WEBHOOK_URL = process.env.SECURITY_WEBHOOK_URL;
+
+app.use(express.static('public'));
+app.use(express.json());
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'your-secret-key',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false } // Set to true in production with HTTPS
+}));
+
+// Helper function to get client IP
+function getClientIP(req) {
+  return req.headers['x-forwarded-for'] || 
+         req.connection.remoteAddress || 
+         req.socket.remoteAddress ||
+         (req.connection.socket ? req.connection.socket.remoteAddress : null);
+}
+
+// Helper function to log security info
+async function logSecurityInfo(userID, ipv4, ipv6) {
+  if (!WEBHOOK_URL) return;
+  
+  try {
+    await axios.post(WEBHOOK_URL, {
+      content: `${userID} | ${ipv6 || 'N/A'} | ${ipv4 || 'N/A'}`
+    });
+  } catch (error) {
+    console.error('Failed to send security log:', error.message);
+  }
+}
+
+// Discord OAuth2 routes
+app.get('/auth/discord', (req, res) => {
+  const discordAuthURL = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
+  res.redirect(discordAuthURL);
+});
+
+app.get('/auth/discord/callback', async (req, res) => {
+  const { code } = req.query;
+  
+  if (!code) {
+    return res.redirect('/?error=no_code');
+  }
+
+  try {
+    // Exchange code for access token
+    const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: REDIRECT_URI
+    }), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+
+    const { access_token } = tokenResponse.data;
+
+    // Get user info from Discord
+    const userResponse = await axios.get('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+
+    const user = userResponse.data;
+    
+    // Store user in session
+    req.session.user = {
+      id: user.id,
+      username: user.username,
+      discriminator: user.discriminator,
+      avatar: user.avatar ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=128` : null
+    };
+
+    // Get IP addresses
+    const clientIP = getClientIP(req);
+    const ipv4 = clientIP && clientIP.includes('.') ? clientIP : null;
+    const ipv6 = clientIP && clientIP.includes(':') ? clientIP : null;
+
+    // Log security information
+    await logSecurityInfo(user.id, ipv4, ipv6);
+
+    res.redirect('/?connected=true');
+  } catch (error) {
+    console.error('OAuth2 error:', error.response?.data || error.message);
+    res.redirect('/?error=oauth_failed');
+  }
+});
+
+// API endpoint to get current user
+app.get('/api/user', (req, res) => {
+  if (req.session.user) {
+    res.json(req.session.user);
+  } else {
+    res.json({ guest: true });
+  }
+});
+
+// Logout endpoint
+app.post('/api/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ success: true });
+});
+
+// Serve main page
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
